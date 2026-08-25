@@ -69,6 +69,8 @@ set(CLUNK_SOURCES
     src/Search/PeepholeMiner.cpp
     src/Search/VectorSynth.cpp
     src/Search/HoleSynth.cpp
+    src/Search/BlockOptimiser.cpp
+    src/Search/SeriesExpander.cpp
     src/Search/AlgoPreprocessor.cpp
     src/Search/LoopOpt.cpp
     src/Search/MemOpt.cpp

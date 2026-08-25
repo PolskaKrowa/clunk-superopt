@@ -63,6 +63,8 @@ struct CliOptions {
     bool no_miner = false;         // --no-miner: disable the in-loop peephole miner
     bool no_vector_synth = false;  // --no-vector-synth: disable vector-intrinsic synthesis
     bool no_hole_synth = false;    // --no-hole-synth: disable hole-based progressive-deepening synthesis
+    bool no_block_opt = false;     // --no-block-opt: disable block-level divide-and-conquer optimisation
+    bool no_series_expand = false; // --no-series-expand: disable series-expansion loop optimisation
     bool no_algo_preprocessor = false;  // --no-algo-preprocessor: disable module-level algo pre-pass
     std::string vector_width = "auto";  // --vector-width <avx512|avx2|avx|auto>
     bool tui = false;             // --tui: launch the ncurses TUI
@@ -179,11 +181,18 @@ static void print_usage(const char* prog) {
               << "  --no-hole-synth           Disable hole-based progressive-deepening synthesis\n"
               << "                            (replaces fn body with a hole, enumerates 1-inst, then 2,\n"
               << "                            then 3 ... equivalents, SMT-verifies each)\n"
+              << "  --no-block-opt            Disable block-level divide-and-conquer optimisation\n"
+              << "                            (splits fn into halving ranges, SMT-proves cheaper\n"
+              << "                            equivalents for each; fallback when whole-fn search\n"
+              << "                            finds nothing)\n"
+              << "  --no-series-expand        Disable series-expansion loop optimisation\n"
+              << "                            (detects arithmetic-series loops, replaces with\n"
+              << "                            closed forms: sum-of-i → n*(n-1)/2, etc.)\n"
               << "  --no-algo-preprocessor    Disable module-level algorithmic preprocessor\n"
               << "                            (detects f(x)=C, f(x)=c*x, f(x)=c*x+b, g(f(x)) collapses)\n"
               << "  --vector-width <tier>     Widest vector tier to attempt (avx512|avx2|avx|auto)\n"
               << "                            Default: auto (= avx512 with cascade fallback)\n"
-              << "  --tui                    Launch an ncurses TUI showing live superoptimiser\n"
+              << "  --tui                     Launch an ncurses TUI showing live superoptimiser\n"
               << "                            progress (function list + current-best IR preview).\n"
               << "                            Requires a tty; ignored (with a warning) otherwise.\n"
               << "                            Keys: ↑/↓ nav, Tab/p pin, r toggle raw IR, q quit.\n"
@@ -213,8 +222,6 @@ static void print_usage(const char* prog) {
               << "  --stagnation-limit <n>    Generations before restart (0 = default)\n"
               << "  --max-function-size <n>   Skip superoptimisation for functions larger than this (default 512)\n"
               << "  --skip-smt                Disable SMT verification entirely (sound: returns Unknown)\n"
-              << "\n"
-              << "Superoptimiser strategies:\n"
               << "  --stoke-moves             Enable STOKE-style unsound search moves (opcode/operand/swap/insert/replace)\n"
               << "                            — candidates are SMT-verified before adoption.\n"
               << "  --test-vectors <n>        Pre-filter candidates with N random test vectors before SMT\n"
@@ -225,15 +232,11 @@ static void print_usage(const char* prog) {
               << "                            above --max-function-size (default 8192; 0 = disable)\n"
               << "  --cache-path <path>       Persistent SMT rewrite cache (file-backed LRU)\n"
               << "  --no-honor-binop-flags    Ignore nsw/nuw/exact flags in SMT encoding (sound fallback)\n"
-              << "\n"
-              << "SMT tuning:\n"
               << "  --smt-timeout <ms>        Per-call Z3 timeout in ms (default 30000)\n"
               << "  --smt-max-blocks <n>      Refuse SMT on functions with more than n blocks (default 20)\n"
               << "  --smt-max-instructions <n>  Refuse SMT on functions with more than n instructions (default 100)\n"
               << "  --max-smt-attempts <n>    Max SMT verify calls per verify_and_select (default 5)\n"
               << "  --smt-bounded-unrolling   Pre-unroll constant-trip single-block loops before SMT (sound)\n"
-              << "\n"
-              << "Cross-function optimisation:\n"
               << "  --no-cross-function       Disable module-level DFE + IPCP pre-pass\n"
               << "  --no-multiblock-inliner   Disable multi-block (CFG-aware) inliner\n"
               << "\n"
@@ -327,6 +330,10 @@ static CliOptions parse_args(int argc, char* argv[]) {
             opts.no_vector_synth = true;
         } else if (arg == "--no-hole-synth") {
             opts.no_hole_synth = true;
+        } else if (arg == "--no-block-opt") {
+            opts.no_block_opt = true;
+        } else if (arg == "--no-series-expand") {
+            opts.no_series_expand = true;
         } else if (arg == "--no-algo-preprocessor") {
             opts.no_algo_preprocessor = true;
         } else if (arg == "--vector-width") {
@@ -790,6 +797,8 @@ int main(int argc, char* argv[]) {
     config.enable_peephole_miner = !opts.no_miner;
     config.enable_vector_synth = !opts.no_vector_synth;
     config.enable_hole_synth = !opts.no_hole_synth;
+    config.enable_block_opt = !opts.no_block_opt;
+    config.enable_series_expand = !opts.no_series_expand;
     config.enable_algo_preprocessor = !opts.no_algo_preprocessor;
 
     // ── Vector width tier ─────────────────────────────────────────────

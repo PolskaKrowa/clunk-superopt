@@ -167,6 +167,30 @@ static BenchResult run_benchmark(const std::string& label,
     return result;
 }
 
+// Helper for calculating doubling numbers up to and including N (only includes N if N is a power of two.)
+
+std::vector<size_t> doublingSequence(size_t N) {
+    std::vector<size_t> result;
+    if (N < 4) {
+        return result;
+    }
+
+    // Precompute the count so we allocate exactly once (no reallocations/copies).
+    size_t count = 0;
+    for (size_t v = 4; v <= N; v <<= 1) {
+        ++count;
+        if (v > (N >> 1)) break; // guard against overflow on next shift
+    }
+
+    result.reserve(count);
+    for (size_t v = 4; v <= N; v <<= 1) {
+        result.push_back(v);
+        if (v > (N >> 1)) break; // stop before v <<= 1 could overflow
+    }
+
+    return result;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Main
 // ═══════════════════════════════════════════════════════════════════════════
@@ -184,9 +208,7 @@ int main(int argc, char** argv) {
     std::vector<BenchResult> results;
 
     // Compute-heavy benchmarks at increasing sizes
-    std::vector<size_t> sizes = {4, 8, 16, 32};
-    if (max_instr > 32) sizes.push_back(64);
-    if (max_instr > 64) sizes.push_back(128);
+    std::vector<size_t> sizes = doublingSequence(max_instr);
 
     for (auto sz : sizes) {
         if (sz > max_instr) break;
@@ -197,7 +219,7 @@ int main(int argc, char** argv) {
     }
 
     // Memory-heavy benchmarks
-    for (auto sz : {4, 8, 16}) {
+    for (auto sz : sizes) {
         Module mod("bench_mem_" + std::to_string(sz));
         auto fn = generate_memory_function(mod, "mem_" + std::to_string(sz), sz);
         std::cout << "  Running memory benchmark with " << sz << " memory ops..." << std::endl;
@@ -212,7 +234,7 @@ int main(int argc, char** argv) {
 
     for (auto& r : results) {
         std::cout << "│ "
-                  << std::left << std::setw(17) << r.label << "│ "
+                  << std::left << std::setw(16) << r.label << "│ "
                   << std::right << std::setw(9) << r.instruction_count << " │ "
                   << std::right << std::setw(15) << std::fixed << std::setprecision(1) << r.stochastic_ms << " │ "
                   << std::right << std::setw(9) << r.stochastic_candidates << " │ "

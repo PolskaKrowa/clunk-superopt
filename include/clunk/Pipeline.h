@@ -42,6 +42,8 @@
 #include "clunk/Search/VectorSynth.h"
 #include "clunk/Search/HoleSynth.h"
 #include "clunk/Search/AlgoPreprocessor.h"
+#include "clunk/Search/BlockOptimiser.h"
+#include "clunk/Search/SeriesExpander.h"
 #include "clunk/Search/ThreadPool.h"
 #include "clunk/Pattern/PatternLibrary.h"
 #include "clunk/IR/StrengthReduce.h"
@@ -304,6 +306,37 @@ struct PipelineConfig {
     bool enable_algo_preprocessor = true;
     search::AlgoPreConfig algo_pre_config;
 
+    // ── Block-level divide-and-conquer optimisation ─────────────────────
+    // When true, the refinement loop runs a block_phase() each round
+    // AFTER the whole-function phases (stochastic, evolutionary, miner,
+    // hole-synth, etc.) — but ONLY if none of those phases produced an
+    // improving candidate this round (i.e. the round was otherwise
+    // stagnant). The block phase splits the function's single basic
+    // block into a binary tree of contiguous instruction ranges
+    // (halving at each level, minimum size 2 instructions) and tries to
+    // SMT-prove a cheaper equivalent for each range, preserving data
+    // flow between ranges. This finds wins the whole-function search
+    // misses (where the whole function has no short equivalent, but a
+    // sub-range does). Sound: every adopted rewrite is SMT-proven.
+    // Default ON at opt_level >= 2; inert on functions outside its
+    // scope (multi-block, FP, memory, etc.).
+    bool enable_block_opt = true;
+    search::BlockOptimiserConfig block_opt_config;
+
+    // ── Series-expansion loop optimisation ───────────────────────────
+    // When true, the refinement loop runs a series_phase() each round
+    // on functions containing loops: it detects single-block loops
+    // that compute arithmetic series (sum of i, sum of a+i*d, constant
+    // accumulation, scaled arithmetic) and replaces the entire loop
+    // with its closed-form expression. This is the classic
+    // superoptimiser "series expansion" win — a loop that sums i for
+    // i=0..n becomes n*(n-1)/2, turning O(n) iterations into O(1)
+    // arithmetic. Sound by construction (the algebra is exact, same
+    // trust tier as LICM/LoopOpt). Default ON at opt_level >= 2;
+    // inert on functions without matching loops.
+    bool enable_series_expand = true;
+    search::SeriesExpanderConfig series_expand_config;
+
     // ── STOKE-style stochastic search moves ────────────────────────────
     // When true, the stochastic search may use the unsound STOKE-style
     // mutation kinds (OpcodeReplace, OperandReplace, OperandSwap,
@@ -519,6 +552,8 @@ private:
         uint64_t last_prune_hash = 0;   // dataflow-prune guard, reset per fn
         uint64_t last_pow2_hash = 0;    // pow2 strength-reduce guard, reset per fn
         uint64_t last_hole_hash = 0;    // hole-synth guard, reset per fn
+        uint64_t last_block_hash = 0;   // block-opt guard, reset per fn
+        uint64_t last_series_hash = 0;  // series-expand guard, reset per fn
         // Rejected-candidate cache: structural hashes of candidates
         // that were SMT-rejected this round-chain. Prevents re-proposing
         // and re-rejecting the same candidate on unchanged baselines.
@@ -584,6 +619,33 @@ private:
     // last_hole_hash — a given baseline is synthesised at most once.
     std::vector<search::Candidate> hole_synth_phase(const ir::Function& fn,
                                                      Searchers& s);
+
+    // ── Block-level divide-and-conquer optimisation phase ─────────────
+    // Runs BlockOptimiser on the current baseline: splits the single
+    // basic block into a binary tree of contiguous instruction ranges
+    // (halving at each level, minimum size 2) and SMT-proves cheaper
+    // equivalents for each range, preserving data flow between ranges.
+    // The candidate carries `sound = proven` (every adopted range
+    // rewrite is SMT-proven equivalent to the input function). Guarded
+    // by last_block_hash — a given baseline is block-optimised at most
+    // once (the optimiser is deterministic for a given baseline).
+    //
+    // This phase is only called by the refinement loop when no whole-
+    // function phase produced an improving candidate this round (i.e.
+    // the round was otherwise stagnant) — it is the "fallback" that
+    // finds wins the whole-function search misses.
+    std::vector<search::Candidate> block_phase(const ir::Function& fn,
+                                                Searchers& s);
+
+    // ── Series-expansion loop optimisation phase ─────────────────────
+    // Runs SeriesExpander on the current baseline: detects single-block
+    // loops computing arithmetic series and replaces them with closed-
+    // form expressions (e.g. `for(i=0;i<n;i++) sum+=i` → `n*(n-1)/2`).
+    // The candidate carries `sound = true` (the algebra is exact by
+    // construction, same trust tier as loop_phase). Guarded by
+    // last_series_hash — a given baseline is expanded at most once.
+    std::vector<search::Candidate> series_phase(const ir::Function& fn,
+                                                  Searchers& s);
 
     // ── Loop-optimisation phase ──────────────────────────────────────────
     // LICM + constant-trip full unrolling of the current baseline. Both

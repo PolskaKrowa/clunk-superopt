@@ -138,6 +138,29 @@ One future addition to Clunk will be to add comments to the optimised IR which s
   (Massalin-style enumerative superoptimisation). Complements the
   stochastic / evolutionary phases as a deterministic,
   completeness-bounded search.
+- **Block-level divide-and-conquer optimisation** -- when the whole-
+  function search is stagnant, splits the function's single basic block
+  into a binary tree of contiguous instruction ranges (halving at each
+  level, minimum size 2 instructions) and SMT-proves cheaper equivalents
+  for each range, preserving data flow between ranges. A range is
+  declared "naturally optimal" if it cannot be improved, or "synthetically
+  optimal" if it was rewritten. When both children of a block are
+  synthetically optimal, the parent is re-tried (the new context may
+  unlock further wins). When all children are naturally optimal, the
+  parent is declared naturally optimal without re-trying. This finds
+  wins the whole-function search misses (where the whole function has
+  no short equivalent, but a sub-range does).
+- **Series-expansion loop optimisation** -- detects single-block loops
+  that compute arithmetic series and replaces the entire loop with its
+  closed-form expression. Recognised patterns:
+  - `for(i=0;i<n;i++) sum += i` → `n*(n-1)/2` (arithmetic series)
+  - `for(i=0;i<n;i++) sum += c` → `c*n` (constant accumulation)
+  - `for(i=0;i<n;i++) sum += i*c` → `c * n*(n-1)/2` (scaled arithmetic)
+  - Handles nonzero start values and non-unit steps.
+  Sound by construction (the algebra is exact, same trust tier as LICM
+  and LoopOpt). Loops with `nsw`/`nuw` flags on the accumulator are
+  refused (the closed form's intermediate multiplications may wrap
+  differently than the original's sequential adds).
 - **Vector synthesis** -- width-aware SIMD superoptimisation. Tries
   AVX-512 → AVX2 → AVX → scalar in cascade order, picking the widest
   tier that yields a verified cheaper rewrite. Performs lane
@@ -238,6 +261,8 @@ clunk [options] <input.ll>
 | `--no-miner` | Disable peephole miner |
 | `--no-vector-synth` | Disable vector synthesis |
 | `--no-hole-synth` | Disable hole-based progressive-deepening synthesis |
+| `--no-block-opt` | Disable block-level divide-and-conquer optimisation (fallback when whole-function search is stagnant) |
+| `--no-series-expand` | Disable series-expansion loop optimisation (arithmetic-series loops → closed forms) |
 | `--no-algo-preprocessor` | Disable module-level algorithmic preprocessor |
 | `--vector-width <tier>` | Widest vector tier to attempt: `avx512`, `avx2`, `avx`, or `auto` (default: auto) |
 | `--tui` | Launch an ncurses TUI showing live superoptimiser progress (function list + current-best IR preview). Keys: ↑/↓ nav, Tab/p pin, r toggle raw IR, q quit. |
@@ -254,7 +279,7 @@ clunk/
     IR/                   -- LLVM IR data structures and utilities
     Analysis/             -- Program analyses (known bits, dataflow)
     Search/               -- Search strategies, SMT verifier, e-graphs, mining,
-                             hole-synth, algo-preprocessor
+                             hole-synth, block-opt, series-expand, algo-preprocessor
     Evaluator/            -- Cost models, interpreter, evaluation engine
     GPU/                  -- PTX emitter, occupancy, divergence, liveness
     Pattern/              -- Pattern library management

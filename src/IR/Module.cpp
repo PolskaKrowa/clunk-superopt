@@ -132,10 +132,7 @@ std::string Module::to_string() const {
 
     // ── Round-trip preservation: emit captured constructs verbatim ──────
     //
-    // Order matters: LLVM IR requires named-metadata definitions to appear
-    // before metadata-id definitions can be referenced (well, actually it
-    // doesn't — forward references are legal — but emitting in source
-    // order matches what clang produces and is easiest to diff).  We emit:
+    // Order matters.
     //
     //   1. module asm "..."        (top of file, after module flags)
     //   2. attributes #N = { ... } (after module asm)

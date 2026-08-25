@@ -32,6 +32,8 @@ set(TEST_SOURCES
     test_smt_bounded_unrolling
     test_opt_level_max
     test_hole_synth
+    test_block_opt
+    test_series_expand
     test_algo_preprocessor
     test_tui
 )

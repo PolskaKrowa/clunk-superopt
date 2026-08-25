@@ -505,12 +505,6 @@ bool AlgoPreprocessor::run(ir::Module& module) {
             if (!chain || chain->callee_names.empty()) continue;
             if (chain->callee_names.size() > config_.max_composition_depth) continue;
 
-            // Probe the composition by evaluating the caller with the
-            // interpreter (which handles Call opcodes by... actually
-            // it doesn't — see Interpreter.h: "Single function (no
-            // calls)". So we need a different approach: evaluate the
-            // chain manually by walking the callees.
-            //
             // Build a synthetic function that inlines the chain and
             // SMT-prove the collapsed form.
 

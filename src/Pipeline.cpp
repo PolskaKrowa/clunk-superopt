@@ -42,6 +42,8 @@
 #include "clunk/Search/LoopOpt.h"
 #include "clunk/Search/MemOpt.h"
 #include "clunk/Search/VectorSynth.h"
+#include "clunk/Search/BlockOptimiser.h"
+#include "clunk/Search/SeriesExpander.h"
 
 #ifdef CLUNK_HAS_GPU
 #include "clunk/GPU/PTXOptimizer.h"
@@ -929,6 +931,8 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
     s.last_prune_hash = 0;
     s.last_pow2_hash = 0;
     s.last_hole_hash = 0;
+    s.last_block_hash = 0;
+    s.last_series_hash = 0;
     s.rejected_hashes.clear();
 
     // Fire a "start" rich progress event so the TUI can mark this
@@ -1056,6 +1060,14 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
                     vector_candidates.end(),
                     std::make_move_iterator(pow2_candidates.begin()),
                     std::make_move_iterator(pow2_candidates.end()));
+                // Series expansion: detect arithmetic-series loops and
+                // replace with closed forms (e.g. sum-of-i → n*(n-1)/2).
+                // Sound by construction; inert on loop-free functions.
+                auto series_candidates = series_phase(*current, s);
+                vector_candidates.insert(
+                    vector_candidates.end(),
+                    std::make_move_iterator(series_candidates.begin()),
+                    std::make_move_iterator(series_candidates.end()));
             }
 
             // Stage 2: Stochastic search from the current baseline.
@@ -1123,6 +1135,32 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
 
             // Stage 4: Verify against the ORIGINAL, select vs `current`
             auto best = verify_and_select(fn, *current, all_candidates, result, s);
+
+            // ── Block-level divide-and-conquer fallback ──────────────────
+            // If no whole-function phase (stochastic, evolutionary, miner,
+            // hole-synth, etc.) produced an improving candidate this round,
+            // try the block optimiser: split the function into a binary
+            // tree of instruction ranges and SMT-prove cheaper equivalents
+            // for each. This is the "fallback" that finds wins the whole-
+            // function search misses (where the whole function has no short
+            // equivalent, but a sub-range does).
+            //
+            // The block optimiser is deterministic (guarded by
+            // last_block_hash) — a given baseline is block-optimised at
+            // most once. The returned candidate is sound-by-construction
+            // (every adopted range rewrite is SMT-proven equivalent to the
+            // input function), so verify_and_select adopts it without
+            // re-verification.
+            if (!best && !oversized && config_.enable_block_opt) {
+                auto block_candidates = block_phase(*current, s);
+                if (!block_candidates.empty()) {
+                    // Re-run verify_and_select with JUST the block candidate.
+                    // `fn` is the original (soundness anchor), `*current` is
+                    // the baseline the block candidate must beat.
+                    best = verify_and_select(fn, *current, block_candidates,
+                                             result, s);
+                }
+            }
 
             // Free candidate memory promptly — each candidate holds a
             // deep copy of the function, and the next round rebuilds its
@@ -1653,6 +1691,112 @@ std::vector<search::Candidate> Pipeline::hole_synth_phase(const ir::Function& fn
                       << " cands/item]";
         }
         std::cerr << "\n";
+    }
+
+    std::vector<search::Candidate> out;
+    out.push_back(std::move(cand));
+    return out;
+}
+
+// ── block_phase (block-level divide-and-conquer optimisation) ──────────────
+
+std::vector<search::Candidate> Pipeline::block_phase(const ir::Function& fn,
+                                                      Searchers& s) {
+    if (config_.opt_level < 2) return {};
+    if (!config_.enable_block_opt) return {};
+    if (remaining_seconds() <= 0.05) return {};
+
+    // The block optimiser is deterministic for a given (fn, config) —
+    // run each distinct baseline at most once.
+    const uint64_t h = search::StochasticSearch::structural_hash(fn);
+    if (h == s.last_block_hash) return {};
+    s.last_block_hash = h;
+
+    search::BlockOptimiserConfig bcfg = config_.block_opt_config;
+    if (config_.smt_config.timeout_ms > 0)
+        bcfg.smt_timeout_ms = config_.smt_config.timeout_ms;
+    // Cap the block optimiser's internal time budget at the pipeline's
+    // remaining wall-clock budget — prevents it from monopolising the
+    // round when no block equivalent exists.
+    double rem = remaining_seconds();
+    if (rem > 0.0 && rem < bcfg.time_budget_seconds) {
+        bcfg.time_budget_seconds = rem;
+    }
+    // Without a prover the optimiser returns rewrites only in best-effort
+    // mode (they then go through verify_and_select's normal Unknown
+    // handling).
+    bcfg.trust_unverified = config_.trust_unverified ||
+                            config_.skip_smt ||
+                            !search::SMTVerifier::is_z3_available();
+
+    search::BlockOptimiser opt(&eval_engine_, bcfg);
+    bool proven = false;
+    auto rewritten = opt.optimize(fn, &proven);
+    if (!rewritten) return {};
+
+    search::Candidate cand;
+    cand.function = rewritten;
+    cand.score = eval_engine_.analyse(*rewritten).score;
+    cand.iteration_found = 0;
+    cand.description = proven
+        ? "block-level divide-and-conquer (SMT-verified)"
+        : "block-level divide-and-conquer (unverified)";
+    cand.structural_hash = search::StochasticSearch::structural_hash(*rewritten);
+    cand.sound = proven;
+
+    if (config_.verbose && should_log_verbose("block", fn.name())) {
+        std::cerr << "  [block] " << fn.name() << ": tried "
+                  << opt.stats().blocks_tried << " block(s), optimised "
+                  << opt.stats().blocks_optimised << ", natural "
+                  << opt.stats().blocks_natural << " ("
+                  << opt.stats().candidates_enumerated << " candidate(s), "
+                  << opt.stats().candidates_smt_verified << " SMT-checked, "
+                  << opt.stats().candidates_equivalent << " equivalent)"
+                  << (proven ? " [proven]" : " [unproven]") << "\n";
+    }
+
+    std::vector<search::Candidate> out;
+    out.push_back(std::move(cand));
+    return out;
+}
+
+// ── series_phase (series-expansion loop optimisation) ──────────────────────
+
+std::vector<search::Candidate> Pipeline::series_phase(const ir::Function& fn,
+                                                        Searchers& s) {
+    if (config_.opt_level < 2) return {};
+    if (!config_.enable_series_expand) return {};
+    if (remaining_seconds() <= 0.05) return {};
+    // Cheap pre-filter: only run on functions with back-edges (loops).
+    if (!ir::has_back_edge(fn)) return {};
+
+    // The expander is deterministic for a given (fn, config) — run each
+    // distinct baseline at most once.
+    const uint64_t h = search::StochasticSearch::structural_hash(fn);
+    if (h == s.last_series_hash) return {};
+    s.last_series_hash = h;
+
+    search::SeriesExpander expander(&eval_engine_, config_.series_expand_config);
+    auto rewritten = expander.expand(fn);
+    if (!rewritten) return {};
+
+    search::Candidate cand;
+    cand.function = rewritten;
+    cand.score = eval_engine_.analyse(*rewritten).score;
+    cand.iteration_found = 0;
+    cand.description = "series expansion (closed-form loop replacement, sound)";
+    cand.structural_hash = search::StochasticSearch::structural_hash(*rewritten);
+    // Exact by construction: the closed-form algebra is mathematically
+    // equivalent to the loop's accumulation (same trust tier as loop_phase
+    // / LICM). The expander refuses loops with nsw/nuw flags on the
+    // accumulator add, so wrapping semantics match exactly.
+    cand.sound = true;
+
+    if (config_.verbose && should_log_verbose("series", fn.name())) {
+        std::cerr << "  [series] " << fn.name() << ": expanded loop to closed form ("
+                  << expander.stats().loops_expanded << " loop(s), "
+                  << expander.stats().loops_matched << " matched, "
+                  << expander.stats().loops_rejected << " rejected)\n";
     }
 
     std::vector<search::Candidate> out;
