@@ -22,6 +22,7 @@ set(TEST_SOURCES
     test_vector_synth
     test_loop_opt
     test_mem_opt
+    test_align_opt
     test_fp_opt
     test_mca
     test_known_bits

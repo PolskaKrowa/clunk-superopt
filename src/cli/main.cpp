@@ -65,6 +65,7 @@ struct CliOptions {
     bool no_hole_synth = false;    // --no-hole-synth: disable hole-based progressive-deepening synthesis
     bool no_block_opt = false;     // --no-block-opt: disable block-level divide-and-conquer optimisation
     bool no_series_expand = false; // --no-series-expand: disable series-expansion loop optimisation
+    bool no_align_opt = false;     // --no-align-opt: disable the alignment finalisation pass
     bool no_algo_preprocessor = false;  // --no-algo-preprocessor: disable module-level algo pre-pass
     std::string vector_width = "auto";  // --vector-width <avx512|avx2|avx|auto>
     bool tui = false;             // --tui: launch the ncurses TUI
@@ -185,6 +186,8 @@ static void print_usage(const char* prog) {
               << "                            (splits fn into halving ranges, SMT-proves cheaper\n"
               << "                            equivalents for each; fallback when whole-fn search\n"
               << "                            finds nothing)\n"
+              << "  --no-align-opt            Disable alignment finalisation (aligned vector\n"
+              << "                            moves where provable; no needless stack realignment)\n"
               << "  --no-series-expand        Disable series-expansion loop optimisation\n"
               << "                            (detects arithmetic-series loops, replaces with\n"
               << "                            closed forms: sum-of-i → n*(n-1)/2, etc.)\n"
@@ -332,6 +335,8 @@ static CliOptions parse_args(int argc, char* argv[]) {
             opts.no_hole_synth = true;
         } else if (arg == "--no-block-opt") {
             opts.no_block_opt = true;
+        } else if (arg == "--no-align-opt") {
+            opts.no_align_opt = true;
         } else if (arg == "--no-series-expand") {
             opts.no_series_expand = true;
         } else if (arg == "--no-algo-preprocessor") {
@@ -799,6 +804,7 @@ int main(int argc, char* argv[]) {
     config.enable_hole_synth = !opts.no_hole_synth;
     config.enable_block_opt = !opts.no_block_opt;
     config.enable_series_expand = !opts.no_series_expand;
+    config.enable_align_opt = !opts.no_align_opt;
     config.enable_algo_preprocessor = !opts.no_algo_preprocessor;
 
     // ── Vector width tier ─────────────────────────────────────────────

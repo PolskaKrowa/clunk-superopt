@@ -40,6 +40,7 @@
 #include "clunk/Search/CrossFunctionPasses.h"
 #include "clunk/Search/Inliner.h"
 #include "clunk/Search/LoopOpt.h"
+#include "clunk/Search/AlignOpt.h"
 #include "clunk/Search/MemOpt.h"
 #include "clunk/Search/VectorSynth.h"
 #include "clunk/Search/BlockOptimiser.h"
@@ -817,6 +818,23 @@ PipelineResult Pipeline::run(const ir::Module& module) {
     // Copy globals to the output module
     for (auto& gv : module.globals()) {
         result.optimised_module->add_global(gv);
+    }
+
+    // Alignment finalisation: needs the globals, so it runs last.
+    if (config_.enable_align_opt && config_.opt_level >= 1) {
+        search::AlignOptimizer aopt;
+        for (auto& fn : result.optimised_module->functions())
+            if (fn)
+                if (auto rewritten = aopt.optimize(*fn, *result.optimised_module)) {
+                    fn = rewritten;
+                    if (auto fr = result.function_results.find(fn->name()); fr != result.function_results.end() && fr->second.optimised)
+                        fr->second.optimised = rewritten;
+                }
+        if (config_.verbose && (aopt.stats().accesses_raised || aopt.stats().allocas_lowered)) {
+            std::cerr << "  [align] raised " << aopt.stats().accesses_raised
+                      << " vector access alignment(s), relaxed "
+                      << aopt.stats().allocas_lowered << " over-aligned alloca(s)\n";
+        }
     }
 
     report_progress("pipeline", "done", 1.0);

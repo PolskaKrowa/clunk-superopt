@@ -1037,6 +1037,7 @@ void IRParser::parse_function_def(std::shared_ptr<ir::Module> mod) {
                 skip_balanced('(', ')');
             }
             if (kw == "align" && peek_token().type == TokenType::Number) {
+                attrs["align"] = peek_token().text;  // consumed by AlignOpt
                 next_token();
             }
         }

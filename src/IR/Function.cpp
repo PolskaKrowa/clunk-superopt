@@ -91,6 +91,8 @@ std::string Function::to_string() const {
     for (size_t i = 0; i < args_.size(); ++i) {
         if (i > 0) s.append(", ");
         s.append(args_[i].type->to_string());
+        // Keep `align N`: AlignOpt's upgrades are justified by it.
+        if (auto a = args_[i].attrs.find("align"); a != args_[i].attrs.end()) s.append(" align " + a->second);
         if (!args_[i].name.empty()) {
             s.append(" %");
             s.append(args_[i].name);

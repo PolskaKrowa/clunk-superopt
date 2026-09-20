@@ -197,6 +197,15 @@ struct PipelineConfig {
     // construction. Default ON.
     bool enable_mem_opt = true;
 
+    // ── Alignment finalisation (vmovupd -> vmovapd, no stack realignment) ─
+    // Module-level finishing pass, run once after every function is
+    // optimised (see clunk/Search/AlignOpt.h): raises vector load/store
+    // `align` to what is PROVABLE (so the backend can emit aligned moves)
+    // and relaxes over-aligned, non-escaping allocas that would otherwise
+    // force a dynamic `and rsp, -N` prologue. Sound by construction.
+    // Default ON at opt_level >= 1.
+    bool enable_align_opt = true;
+
     // ── Dataflow pruning (dead-code + same-block CSE + unreachable-block
     //     elimination + known-bits-driven constant/branch folding) ───────
     // Runs ir::prune_dataflow() on the current baseline every round,

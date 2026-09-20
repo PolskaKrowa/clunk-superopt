@@ -74,6 +74,7 @@ set(CLUNK_SOURCES
     src/Search/AlgoPreprocessor.cpp
     src/Search/LoopOpt.cpp
     src/Search/MemOpt.cpp
+    src/Search/AlignOpt.cpp
     src/Search/Inliner.cpp
     src/Search/CrossFunctionPasses.cpp
     src/Search/EgraphRewriter.cpp

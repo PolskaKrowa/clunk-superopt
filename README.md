@@ -175,6 +175,13 @@ One future addition to Clunk will be to add comments to the optimised IR which s
   the work the per-function pipeline has to do.
 - **Loop optimisation** -- loop-aware transformations and analysis.
 - **Memory optimisation** -- memory access pattern improvements.
+- **Alignment finalisation** -- a last pass over the whole module that
+  raises vector load/store `align` to whatever is *provable* (so the
+  backend emits `vmovapd` rather than `vmovupd`), and relaxes over-aligned,
+  non-escaping allocas that would otherwise force a dynamic `and rsp, -N`
+  stack realignment. Provable alignment comes only from `alloca`/global/
+  `align N` parameter roots, propagated through GEP/bitcast/phi/select.
+  Never lowers an existing claim. Disable with `--no-align-opt`.
 - **Cost model evaluation** -- TTI-based and MCA-based (llvm-mca) cost
   estimation to rank candidate programs.
 - **GPU/PTX optimisation stubs** -- PTX emitter, occupancy model, divergence
