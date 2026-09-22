@@ -1943,6 +1943,17 @@ void* SMTVerifier::get_z3_context() const {
 
 // ── Public verify ──────────────────────────────────────────────────────────
 
+// The result for a candidate the concrete screen rejected: a proof of
+// NotEquivalent with a real counterexample, produced without the solver.
+static VerificationResult screened_result(const evaluator::ScreenResult& sr) {
+    VerificationResult r;
+    r.status = VerificationResult::NotEquivalent;
+    r.message = "concrete screen: " + sr.reason;
+    r.counterexample = sr.counterexample;
+    r.screened = true;
+    return r;
+}
+
 VerificationResult SMTVerifier::verify(const ir::Function& original,
                                         const ir::Function& candidate) {
     // ── Vector lowering (lane-blasting) ────────────────────────────────
@@ -2031,6 +2042,22 @@ VerificationResult SMTVerifier::verify(const ir::Function& original,
             }
             return result;
         }
+    }
+
+    // ── Concrete-input screen: only survivors reach the solver ─────────
+    // After the cache (a cached verdict is free) and before any solver work.
+    // Rejections are deliberately NOT cached: they cost microseconds to
+    // recompute, and a cache entry would outlive any future fix to the
+    // screen itself.
+    if (config_.screen_before_solving) {
+        const auto sr = evaluator::DifferentialScreen(config_.screen).screen(original, candidate);
+        if (sr.verdict == evaluator::ScreenVerdict::Rejected) {
+            stats_.verifications_run++;
+            stats_.not_equivalent++;
+            stats_.screened_out++;
+            return screened_result(sr);
+        }
+        if (sr.verdict == evaluator::ScreenVerdict::Survived) stats_.screen_passed++;
     }
 
     if (z3_available_) {
@@ -2160,6 +2187,39 @@ std::vector<VerificationResult> SMTVerifier::verify_batch(
 std::vector<VerificationResult> SMTVerifier::verify_batch(
     const ir::Function& original,
     const std::vector<ir::Function>& candidates) {
+
+    // Screen first (the incremental Z3 path below never calls verify()):
+    // rejected candidates are answered here, only survivors are encoded.
+    if (config_.screen_before_solving) {
+        std::vector<VerificationResult> screened(candidates.size());
+        std::vector<ir::Function> survivors;
+        std::vector<size_t> survivor_slot;
+        const evaluator::DifferentialScreen screen(config_.screen);
+        bool any_rejected = false;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const auto sr = screen.screen(original, candidates[i]);
+            if (sr.verdict == evaluator::ScreenVerdict::Rejected) {
+                screened[i] = screened_result(sr);
+                stats_.verifications_run++;
+                stats_.not_equivalent++;
+                stats_.screened_out++;
+                any_rejected = true;
+            } else {
+                if (sr.verdict == evaluator::ScreenVerdict::Survived) stats_.screen_passed++;
+                survivors.push_back(candidates[i]);
+                survivor_slot.push_back(i);
+            }
+        }
+        if (any_rejected) {
+            // Recurse on the survivors with the screen off: they were just screened.
+            const bool saved = config_.screen_before_solving;
+            config_.screen_before_solving = false;
+            auto rest = verify_batch(original, survivors);
+            config_.screen_before_solving = saved;
+            for (size_t k = 0; k < survivors.size(); ++k) screened[survivor_slot[k]] = rest[k];
+            return screened;
+        }
+    }
 
     std::vector<VerificationResult> results;
     results.reserve(candidates.size());

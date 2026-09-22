@@ -32,6 +32,8 @@
 #include "clunk/IR/Module.h"
 #include "clunk/IR/IRBuilder.h"
 #include "clunk/Pattern/PatternLibrary.h"
+#include "clunk/IR/Verify.h"
+#include "clunk/Parser/IRParser.h"
 
 static int g_pass = 0, g_fail = 0;
 
@@ -42,6 +44,7 @@ static int g_pass = 0, g_fail = 0;
 
 using namespace clunk::ir;
 using namespace clunk::pattern;
+using clunk::parser::IRParser;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Helper
@@ -458,6 +461,127 @@ void test_apply_rejects_invalid_result() {
     CHECK(true, "apply on potentially-invalid match completed without crash");
 }
 
+// ── Test: apply() at a non-i32 width does not corrupt result types ────────
+// Every seed pattern is AUTHORED at i32. Applying one to an i8/i16/i64
+// function used to leave the replacement's `ret` (or a same-width binop)
+// typed i32 regardless of the actual match — e.g. `ret i32 %a2` where %a2
+// is i8, which LLVM's own parser rejects outright. Cover a spread of
+// widths and patterns; ir::verify_function is the same check apply()'s
+// own safety net runs, so this also pins that net staying in place.
+void test_apply_preserves_non_i32_width() {
+    struct Case { const char* body; const char* pattern_id; };
+    const Case cases[] = {
+        {"  %r = add %x, 0\n  ret %r\n", "add_zero_elim"},
+        {"  %r = mul %x, 1\n  ret %r\n", "mul_one_elim"},
+    };
+    for (unsigned width : {8u, 16u, 64u}) {
+        PatternLibrary lib;
+        auto arch = make_x86_64_arch();
+        for (const auto& c : cases) {
+            IRParser p;
+            // Build the body with the instruction's own opcode inferred from c.body's mnemonic.
+            std::string mnem(c.body);
+            mnem = mnem.substr(mnem.find('=') + 2);
+            mnem = mnem.substr(0, mnem.find(' '));
+            std::string full = "define i" + std::to_string(width) + " @f(i" + std::to_string(width) + " %x) {\nentry:\n" +
+                "  %r = " + mnem + " i" + std::to_string(width) + " %x, " +
+                (mnem == "mul" ? "1" : "0") + "\n  ret i" + std::to_string(width) + " %r\n}\n";
+            auto mod = p.parse_string(full.c_str());
+            CHECK(mod != nullptr, std::string("parses at width ") + std::to_string(width) + ": " + c.pattern_id);
+            if (!mod) continue;
+            auto fn = mod->function("f");
+            CHECK(fn != nullptr, "function f exists");
+            if (!fn) continue;
+
+            auto matches = lib.match(*fn, arch);
+            bool found = false;
+            for (auto& m : matches) {
+                if (m.pattern_id != c.pattern_id) continue;
+                found = true;
+                auto result = lib.apply(*fn, m, arch);
+                CHECK(result != nullptr, std::string(c.pattern_id) + " applies at i" + std::to_string(width));
+                if (!result) break;
+                CHECK(clunk::ir::verify_function(*result).empty(),
+                      std::string(c.pattern_id) + " result is well-typed at i") ;
+                // Specifically: the ret must be typed exactly like the function's
+                // declared return width, not hardcoded i32.
+                for (auto& bb : result->blocks())
+                    for (auto& in : bb->instructions())
+                        if (in && in->opcode() == Opcode::Ret && in->num_operands() == 1) {
+                            CHECK(in->type() && in->type()->bit_width() == width,
+                                  std::string(c.pattern_id) + " ret is i" + std::to_string(width) +
+                                  ", not hardcoded i32");
+                            CHECK(in->operand(0)->type() && in->operand(0)->type()->bit_width() == width,
+                                  std::string(c.pattern_id) + " ret operand is i" + std::to_string(width));
+                        }
+                break;
+            }
+            CHECK(found, std::string(c.pattern_id) + " matched at width " + std::to_string(width));
+        }
+    }
+}
+
+// ── Test: apply() rejects a pattern whose replacement is malformed ────────
+// A pattern library bug (an operand-less instruction, a stray type) must be
+// caught by apply()'s ir::verify_function safety net and rejected, not
+// handed back to the caller as invalid IR.
+void test_apply_rejects_malformed_replacement() {
+    PatternLibrary lib;
+    Module mod("malformed_test");
+    TypeContext& ctx = mod.type_context();
+    auto fn_type = std::make_shared<FunctionType>(ctx.int32(), std::vector<std::shared_ptr<Type>>{ctx.int32()});
+
+    OptimisationPattern pat;
+    pat.id = "test_malformed_shl";
+    pat.name = "malformed (test-only)";
+    pat.description = "regression test: an operand-less shl must be rejected";
+    pat.discovered_arch = ArchDescriptor{"generic", "any", false, 0, 0};
+    pat.avg_speedup = 1.5;
+    pat.scope = OptimisationPattern::Scope::InstructionLevel;
+    pat.tags = {"test"};
+    {
+        auto fn = std::make_shared<Function>("__src", fn_type);
+        fn->add_argument(ctx.int32(), "x");
+        auto& bb = fn->add_block("entry");
+        auto x_val = std::make_shared<Value>(ctx.int32(), "x");
+        auto one = ConstantInt::get(ctx, 1, 32);
+        bb.add_instruction(inst::make_mul(x_val, one, "r"));
+        bb.add_instruction(inst::make_ret(bb.instruction(0)));
+        pat.source_function = fn;
+    }
+    {
+        auto fn = std::make_shared<Function>("__rep", fn_type);
+        fn->add_argument(ctx.int32(), "x");
+        auto& bb = fn->add_block("entry");
+        // An operand-less shl, exactly the shape the E-graph and the seed
+        // pattern used to produce before both were fixed.
+        auto bad = std::make_shared<Instruction>(Opcode::Shl, ctx.int32(), "r");
+        bb.add_instruction(bad);
+        bb.add_instruction(inst::make_ret(std::make_shared<Value>(ctx.int32(), "r")));
+        pat.replacement_function = fn;
+    }
+    lib.add_pattern(pat);
+
+    auto& fn = mod.add_function("f", fn_type);
+    fn.add_argument(ctx.int32(), "x");
+    auto& entry = fn.add_block("entry");
+    auto x_val = std::make_shared<Value>(ctx.int32(), "x");
+    auto one = ConstantInt::get(ctx, 1, 32);
+    entry.add_instruction(inst::make_mul(x_val, one, "r"));
+    entry.add_instruction(inst::make_ret(entry.instruction(0)));
+
+    auto arch = make_x86_64_arch();
+    auto matches = lib.match(fn, arch);
+    bool found = false;
+    for (auto& m : matches) {
+        if (m.pattern_id != "test_malformed_shl") continue;
+        found = true;
+        auto result = lib.apply(fn, m, arch);
+        CHECK(result == nullptr, "apply() rejects a malformed replacement rather than returning invalid IR");
+    }
+    CHECK(found, "the malformed test pattern matched");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 
 int main() {
@@ -513,6 +637,12 @@ int main() {
 
     std::cout << "  apply rejects invalid result..." << std::endl;
     test_apply_rejects_invalid_result();
+
+    std::cout << "  apply preserves non-i32 width..." << std::endl;
+    test_apply_preserves_non_i32_width();
+
+    std::cout << "  apply rejects malformed replacement..." << std::endl;
+    test_apply_rejects_malformed_replacement();
 
     std::cout << "\n=== Results: " << g_pass << " passed, " << g_fail << " failed ===" << std::endl;
     return g_fail > 0 ? 1 : 0;

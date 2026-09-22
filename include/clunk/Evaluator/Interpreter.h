@@ -33,6 +33,16 @@
  *   - Floats, calls, GEP into struct/array, vector ops, etc. are
  *     unsupported and return std::nullopt.
  *
+ * Semantics follow LLVM's LangRef, not C++'s:
+ *   - values are canonicalised to their type's width (arguments and
+ *     constants included), so an i8 argument of 255 is -1;
+ *   - unsigned ops (lshr/udiv/urem/ult...) see the width-masked value;
+ *   - `nsw`/`nuw`/`exact` violations and shift amounts >= the bit width
+ *     yield POISON; division by zero, INT_MIN / -1, `unreachable` and a
+ *     branch on poison are UNDEFINED BEHAVIOUR.
+ * run() reports all four outcomes; interpret() keeps its historical
+ * shape (poison yields the wrapped value; UB and unsupported are nullopt).
+ *
  * The interpreter is intentionally side-effect-free beyond its own
  * internal state: it does not modify the IR, does not allocate OS
  * resources, and is safe to call concurrently on independent
@@ -48,8 +58,25 @@
 
 namespace clunk::evaluator {
 
+// What happened when a function was run on concrete inputs.
+enum class ExecStatus {
+    Value,        // returned a fully defined value
+    Poison,       // returned poison (`value` is the wrapped result, meaningless)
+    UB,           // executed undefined behaviour (div by zero, branch on poison, ...)
+    Unsupported   // uses something we cannot model, or exceeded the hop cap
+};
+
+struct ExecOutcome {
+    ExecStatus status = ExecStatus::Unsupported;
+    int64_t value = 0;   // canonical: sign-extended from the return type's width
+};
+
 class Interpreter {
 public:
+    // Run `fn` on `args` (one per parameter; canonicalised to each
+    // parameter's width). Never throws.
+    static ExecOutcome run(const ir::Function& fn, const std::vector<int64_t>& args);
+
     // Evaluate `fn` on the supplied integer argument list. Returns
     // std::nullopt if the function is unsupported (non-integer ops,
     // calls, infinite loop guard tripped, …) or the argument count

@@ -52,6 +52,8 @@ set(CLUNK_SOURCES
     src/IR/DataflowPrune.cpp
     src/IR/StrengthReduce.cpp
     src/Analysis/KnownBits.cpp
+    src/Analysis/LiveOut.cpp
+    src/Analysis/DemandedBits.cpp
     src/Analysis/PowersOfTwo.cpp
     src/Analysis/CallGraph.cpp
     src/Parser/IRParser.cpp
@@ -60,6 +62,7 @@ set(CLUNK_SOURCES
     src/Evaluator/CostModel.cpp
     src/Evaluator/EvaluationCache.cpp
     src/Evaluator/Interpreter.cpp
+    src/Evaluator/DifferentialScreen.cpp
     src/Evaluator/MCACostModel.cpp
     src/Search/StochasticSearch.cpp
     src/Search/EvolutionarySearch.cpp

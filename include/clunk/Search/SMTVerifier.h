@@ -57,6 +57,7 @@
 #include <optional>
 #include <cstdint>
 #include <utility>
+#include "clunk/Evaluator/DifferentialScreen.h"
 #include "clunk/IR/Function.h"
 #include "clunk/IR/Instruction.h"  // ir::CmpPredicate (ArgAssumption)
 
@@ -86,6 +87,12 @@ struct VerificationResult {
     // Human-readable reason for Unknown/Error (e.g. "function contains
     // memory operations", "Z3 timeout", "Z3 error: ...").
     std::string z3_reason;
+
+    // True when the concrete-input screen (see SMTConfig::screen_before_
+    // solving) decided this result: no solver was invoked and the
+    // counterexample is a real input. Callers that budget solver calls
+    // should not charge a screened result against that budget.
+    bool screened = false;
 
     bool is_safe() const { return status == Equivalent; }
 };
@@ -149,6 +156,19 @@ struct SynthesisResult {
 
 // ── SMT configuration ──────────────────────────────────────────────────
 struct SMTConfig {
+    // ── Concrete-input screen ───────────────────────────────────────────
+    // When true (default), verify() first runs both functions on a few
+    // hundred edge-case and random inputs (0, -1, INT_MIN, powers of two,
+    // ... — see evaluator::DifferentialScreen). A candidate that is not a
+    // refinement on some input is answered NotEquivalent immediately, with
+    // that input as the counterexample; only survivors reach the solver.
+    // The screen follows the same refinement semantics as the encoder, so
+    // it never rejects anything the solver would have accepted.
+    // verify_with_assumptions() is exempt: random inputs would violate the
+    // path condition it is proving under.
+    bool screen_before_solving = true;
+    evaluator::ScreenConfig screen;
+
     unsigned timeout_ms = 30000;    // Z3 solver timeout (wall-clock)
     bool simplify_before = true;    // Run Z3 simplification first
     bool use_bitvectors = true;     // Use BV theory instead of integers
@@ -341,6 +361,8 @@ public:
         size_t not_equivalent = 0;
         size_t unknown = 0;
         size_t errors = 0;
+        size_t screened_out = 0;    // rejected by the concrete screen (no solver call)
+        size_t screen_passed = 0;   // survived the screen and went on to the solver
         double total_time_ms = 0.0;
         double avg_time_ms = 0.0;
     };

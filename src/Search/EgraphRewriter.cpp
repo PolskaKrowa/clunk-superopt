@@ -29,6 +29,8 @@
  * Self-contained: no egg, no Boost, no new link-time deps. C++17.
  */
 #include "clunk/Search/EgraphRewriter.h"
+
+#include "clunk/IR/Verify.h"
 #include "clunk/Search/StochasticSearch.h"  // for Candidate + structural_hash
 
 #include <algorithm>
@@ -43,8 +45,23 @@ namespace clunk::egraph {
 //  ENode hashing & equality
 // ─────────────────────────────────────────────────────────────────────────
 
+// Two nodes are the same VALUE only if they also have the same TYPE. A leaf
+// has no children, and a cast's children do not fix its destination, so
+// (opcode, children) alone cannot tell `i8 1` from `i64 1` or
+// `zext i8 %x to i32` from `zext i8 %x to i64`. Hash-consing them together
+// made extraction emit one width where the other was needed — an
+// operand-width mismatch LLVM rejects.
+static bool same_type(const std::shared_ptr<ir::Type>& a,
+                      const std::shared_ptr<ir::Type>& b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    return a->type_id() == b->type_id() && a->bit_width() == b->bit_width() &&
+           a->to_string() == b->to_string();
+}
+
 bool ENode::operator==(const ENode& other) const {
     if (opcode != other.opcode) return false;
+    if (!same_type(result_type, other.result_type)) return false;
     if (is_constant != other.is_constant) return false;
     if (is_argument != other.is_argument) return false;
     if (is_constant && constant_value != other.constant_value) return false;
@@ -79,6 +96,10 @@ size_t ENodeHash::operator()(const ENode& n) const noexcept {
     hash_combine(h, std::hash<bool>{}(n.flags.nuw));
     hash_combine(h, std::hash<bool>{}(n.flags.nsw));
     hash_combine(h, std::hash<bool>{}(n.flags.exact));
+    if (n.result_type) {  // equal nodes have equal types, so this is hash-consistent
+        hash_combine(h, std::hash<int>{}(static_cast<int>(n.result_type->type_id())));
+        hash_combine(h, std::hash<size_t>{}(static_cast<size_t>(n.result_type->bit_width())));
+    }
     return h;
 }
 
@@ -225,6 +246,26 @@ bool as_constant_int(const std::shared_ptr<ir::Value>& v, int64_t& out) {
     return true;
 }
 
+// The e-graph hash-conses by (opcode, children): that is only sound for
+// pure computations whose value depends on nothing but their operands.
+// Loads (memory state), calls (effects), allocas (identity), phis (their
+// value depends on the incoming EDGE, which is not part of a node) and
+// friends must stay opaque: two structurally identical loads are NOT the
+// same value, and a phi cannot be rebuilt without its incoming blocks.
+bool is_pure_value_op(ir::Opcode op) {
+    switch (op) {
+        case ir::Opcode::Add: case ir::Opcode::Sub: case ir::Opcode::Mul:
+        case ir::Opcode::UDiv: case ir::Opcode::SDiv: case ir::Opcode::URem: case ir::Opcode::SRem:
+        case ir::Opcode::And: case ir::Opcode::Or: case ir::Opcode::Xor:
+        case ir::Opcode::Shl: case ir::Opcode::LShr: case ir::Opcode::AShr:
+        case ir::Opcode::ICmp: case ir::Opcode::Select:
+        case ir::Opcode::ZExt: case ir::Opcode::SExt: case ir::Opcode::Trunc:
+            return true;
+        default:
+            return false;
+    }
+}
+
 ir::CmpPredicate predicate_from_inst(const ir::Instruction& inst) {
     auto& md = inst.metadata();
     auto it = md.find("pred");
@@ -292,6 +333,10 @@ LoweringResult lower_to_egraph(const ir::Function& fn) {
             // Skip instructions with no name (no result) — e.g. Store.
             if (!inst->has_name()) continue;
 
+            // Anything that is not a pure value computation stays opaque:
+            // extraction copies it verbatim and later uses see it as a leaf.
+            if (!is_pure_value_op(inst->opcode())) continue;
+
             // Resolve operands to e-class ids.
             ENode node;
             node.opcode = inst->opcode();
@@ -321,8 +366,12 @@ LoweringResult lower_to_egraph(const ir::Function& fn) {
                         onode.is_argument = true;
                         onode.argument_name = op->name();
                         onode.result_type = op->type();
+                        // Hash-consing already gives every reference to this
+                        // name the same leaf class. It must NOT be recorded in
+                        // value_to_class: that map means "lowered instruction",
+                        // and extraction would then skip emitting the (opaque)
+                        // instruction that defines this value.
                         EClassId cid = result.egraph->add(onode);
-                        result.value_to_class[op->name()] = cid;
                         node.children.push_back(cid);
                     } else {
                         node.children.push_back(it->second);
@@ -370,6 +419,9 @@ build_name_map(const ir::Function& fn) {
 
 bool opcodes_compatible(const ir::Instruction& inst, const ENode& node) {
     if (inst.opcode() != node.opcode) return false;
+    // Patterns are written at one width (i32); applying one to a value of
+    // another width would splice pattern-typed nodes into the subject.
+    if (!same_type(inst.type(), node.result_type)) return false;
     if (inst.is_cmp() && node.predicate != predicate_from_inst(inst)) return false;
     if (inst.is_binary_op()) {
         if (inst.binop_flags().nuw != node.flags.nuw) return false;
@@ -427,7 +479,8 @@ bool match_value(const std::shared_ptr<ir::Value>& value,
     int64_t cv = 0;
     if (as_constant_int(value, cv)) {
         for (auto& node : eg.classes()[canon].nodes) {
-            if (node.is_constant && node.constant_value == cv) return true;
+            if (node.is_constant && node.constant_value == cv &&
+                same_type(node.result_type, value->type())) return true;
         }
         return false;
     }
@@ -506,6 +559,13 @@ std::optional<EClassId> build_replacement(
         }
         if (inst->is_terminator()) continue;
         if (!inst->has_name()) continue;
+
+        // A replacement instruction with too few operands is a malformed
+        // pattern (the seed strength_reduce_mul used to build an operand-less
+        // `shl`). Merging it into the subject's e-class would let extraction
+        // emit `%r = shl i32` — invalid IR — so refuse the whole rewrite.
+        if (inst->num_operands() < ir::verify_detail::min_operands(inst->opcode()))
+            return std::nullopt;
 
         ENode node;
         node.opcode = inst->opcode();
@@ -663,15 +723,25 @@ struct ExtractCtx {
     const evaluator::CostModel& cm;
     const std::unordered_map<EClassId, ENode>& best_node;
     std::unordered_map<EClassId, std::shared_ptr<ir::Value>> memo;
+    // Block each memoised INSTRUCTION was emitted into (nullptr for leaves).
+    // A value may only be reused where its definition is guaranteed to
+    // dominate: the same block, or the entry block (which dominates all).
+    std::unordered_map<EClassId, const ir::BasicBlock*> memo_block;
     std::unordered_map<std::string, std::shared_ptr<ir::Value>> binding;
     ir::BasicBlock* current_bb = nullptr;
+    const ir::BasicBlock* entry_bb = nullptr;
     size_t counter = 0;
 };
 
 std::shared_ptr<ir::Value> materialise(EClassId cls, ExtractCtx& ctx) {
     EClassId canon = ctx.eg.find(cls);
     auto m = ctx.memo.find(canon);
-    if (m != ctx.memo.end()) return m->second;
+    if (m != ctx.memo.end()) {
+        const ir::BasicBlock* def_bb = ctx.memo_block[canon];
+        if (!def_bb || def_bb == ctx.current_bb || def_bb == ctx.entry_bb) return m->second;
+        // Defined in a block that need not dominate this one (e.g. the same
+        // expression computed in both arms of a branch): rebuild it here.
+    }
 
     auto bn = ctx.best_node.find(canon);
     if (bn == ctx.best_node.end()) return nullptr;
@@ -706,9 +776,13 @@ std::shared_ptr<ir::Value> materialise(EClassId cls, ExtractCtx& ctx) {
             ctx.current_bb->add_instruction(inst);
         }
         result = inst;
+        ctx.memo[canon] = result;
+        ctx.memo_block[canon] = ctx.current_bb;
+        return result;
     }
 
     ctx.memo[canon] = result;
+    ctx.memo_block[canon] = nullptr;  // argument / constant leaf
     return result;
 }
 
@@ -762,14 +836,35 @@ std::shared_ptr<ir::Function> EgraphRewriter::extract(
         out->set_attribute(k, v);
     }
 
-    ExtractCtx ctx{*egraph_, cm, best_node, {}, {}, nullptr, 0};
+    ExtractCtx ctx{*egraph_, cm, best_node, {}, {}, {}, nullptr, nullptr, 0};
     for (auto& arg : out->arguments()) {
         ctx.binding[arg.name] = std::make_shared<ir::Value>(arg.type, arg.name);
     }
 
+    // Instructions we copy rather than rebuild (terminators, phis, memory,
+    // calls, ...). Copies preserve EVERYTHING — including alignment and
+    // volatile, which the old hand-rolled copies silently dropped.
+    std::vector<std::shared_ptr<ir::Instruction>> copies;
+    auto copy_verbatim = [&](ir::BasicBlock& bb, const std::shared_ptr<ir::Instruction>& inst) {
+        auto copy = std::make_shared<ir::Instruction>(inst->opcode(), inst->type(), inst->name());
+        for (auto& op : inst->operands()) {
+            copy->add_operand(resolve_operand(op, ctx.binding));
+        }
+        for (auto& [k, v] : inst->metadata()) {
+            copy->set_metadata(k, v);
+        }
+        copy->binop_flags() = inst->binop_flags();
+        if (inst->alignment()) copy->set_alignment(inst->alignment().value());
+        copy->set_volatile(inst->is_volatile());
+        bb.add_instruction(copy);
+        if (inst->has_name()) ctx.binding[inst->name()] = copy;
+        copies.push_back(copy);
+    };
+
     for (auto& block : src.blocks()) {
         if (!block) continue;
         auto& new_bb = out->add_block(block->name());
+        if (!ctx.entry_bb) ctx.entry_bb = &new_bb;
         ctx.current_bb = &new_bb;
 
         for (auto& inst : block->instructions()) {
@@ -802,37 +897,11 @@ std::shared_ptr<ir::Function> EgraphRewriter::extract(
                 continue;
             }
 
-            // Other terminators: copy verbatim, resolving value operands.
-            if (inst->is_terminator()) {
-                auto copy = std::make_shared<ir::Instruction>(inst->opcode(),
-                                                               inst->type(), inst->name());
-                for (auto& op : inst->operands()) {
-                    copy->add_operand(resolve_operand(op, ctx.binding));
-                }
-                for (auto& [k, v] : inst->metadata()) {
-                    copy->set_metadata(k, v);
-                }
-                copy->binop_flags() = inst->binop_flags();
-                new_bb.add_instruction(copy);
-                if (inst->has_name()) ctx.binding[inst->name()] = copy;
-                continue;
-            }
-
-            // Non-terminator: check if it was lowered.
+            // Other terminators, and anything that was not lowered (phis,
+            // memory, calls, unnamed effects): copy verbatim.
             auto lc = lowering.value_to_class.find(inst->name());
-            if (lc == lowering.value_to_class.end()) {
-                // Not lowered — copy verbatim.
-                auto copy = std::make_shared<ir::Instruction>(inst->opcode(),
-                                                               inst->type(), inst->name());
-                for (auto& op : inst->operands()) {
-                    copy->add_operand(resolve_operand(op, ctx.binding));
-                }
-                for (auto& [k, v] : inst->metadata()) {
-                    copy->set_metadata(k, v);
-                }
-                copy->binop_flags() = inst->binop_flags();
-                new_bb.add_instruction(copy);
-                if (inst->has_name()) ctx.binding[inst->name()] = copy;
+            if (inst->is_terminator() || lc == lowering.value_to_class.end()) {
+                copy_verbatim(new_bb, inst);
                 continue;
             }
 
@@ -841,22 +910,20 @@ std::shared_ptr<ir::Function> EgraphRewriter::extract(
             if (v) {
                 ctx.binding[inst->name()] = v;
             } else {
-                // Fallback: copy verbatim.
-                auto copy = std::make_shared<ir::Instruction>(inst->opcode(),
-                                                               inst->type(), inst->name());
-                for (auto& op : inst->operands()) {
-                    copy->add_operand(resolve_operand(op, ctx.binding));
-                }
-                for (auto& [k, v2] : inst->metadata()) {
-                    copy->set_metadata(k, v2);
-                }
-                copy->binop_flags() = inst->binop_flags();
-                new_bb.add_instruction(copy);
-                if (inst->has_name()) ctx.binding[inst->name()] = copy;
+                copy_verbatim(new_bb, inst);  // fallback
             }
         }
 
         ctx.current_bb = nullptr;
+    }
+
+    // A copy may name a value that extraction only (re)defined LATER under a
+    // new `_eg_N` name — the loop back-edge of a phi is the classic case.
+    // Now that every original name is bound, resolve the copies again.
+    for (auto& c : copies) {
+        for (size_t i = 0; i < c->num_operands(); ++i) {
+            c->set_operand(i, resolve_operand(c->operand(i), ctx.binding));
+        }
     }
 
     return out;
@@ -895,6 +962,10 @@ std::optional<Candidate> egraph_rewrite(
     // lowering.source_function from the LoweringResult.
     std::shared_ptr<ir::Function> candidate = rw.extract(lower, eval);
     if (!candidate) return std::nullopt;
+
+    // Last line of defence: candidates from here are flagged sound and skip
+    // the prover, so nothing malformed may ever leave this function.
+    if (!ir::verify_function(*candidate).empty()) return std::nullopt;
 
     // 5. Score and compare.
     double ratio = eval.score_candidate(fn, *candidate);

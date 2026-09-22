@@ -21,6 +21,8 @@
  * the pattern matcher itself is Clunk-optimised.
  */
 #include "clunk/Pattern/PatternLibrary.h"
+
+#include "clunk/IR/Verify.h"
 #include "clunk/IR/Clone.h"  // for ir::validate_function
 #include "clunk/Parser/IRParser.h"  // reparse persisted pattern IR into functions
 
@@ -535,14 +537,27 @@ std::shared_ptr<ir::Function> PatternLibrary::apply(
         -> std::shared_ptr<ir::Instruction>
     {
         if (!repl_inst) return nullptr;
-        auto new_inst = std::make_shared<ir::Instruction>(
-            repl_inst->opcode(), repl_inst->type(), repl_inst->name());
+
+        // Patterns are AUTHORED at one width (every seed pattern is i32),
+        // but must apply at whatever integer width the matched subject
+        // actually is. Resolve operands FIRST, then derive the result
+        // type from them where LLVM requires it to track the operand:
+        // `ret` always returns its operand's type, and a same-width
+        // binary op's result is its operands' type. Blindly copying the
+        // pattern's own authored type here used to leave a `ret i32 %x`
+        // wrapped around an i8/i64 %x whenever a pattern matched a
+        // non-i32 function — invalid IR that only surfaced once the
+        // (recently added) verifier or an LLVM parse actually checked it.
+        // Casts, select, icmp and phi are left alone: their result width
+        // is a deliberate choice of the pattern, not implied by operand 0.
+        std::vector<std::shared_ptr<ir::Value>> new_operands;
+        new_operands.reserve(repl_inst->num_operands());
         for (auto& op : repl_inst->operands()) {
             if (op && op->has_name()) {
                 auto it2 = operand_map.find(op->name());
                 if (it2 != operand_map.end()) {
                     // Rewrite to the bound target value.
-                    new_inst->add_operand(it2->second);
+                    new_operands.push_back(it2->second);
                     continue;
                 }
                 // Name not in the map — this is either a value defined
@@ -551,8 +566,26 @@ std::shared_ptr<ir::Function> PatternLibrary::apply(
                 // through unchanged; validate_function will catch the
                 // latter case below.
             }
-            new_inst->add_operand(op);
+            new_operands.push_back(op);
         }
+
+        auto new_type = repl_inst->type();
+        const ir::Opcode op = repl_inst->opcode();
+        const bool width_tracks_operand0 =
+            op == ir::Opcode::Add || op == ir::Opcode::Sub || op == ir::Opcode::Mul ||
+            op == ir::Opcode::UDiv || op == ir::Opcode::SDiv ||
+            op == ir::Opcode::URem || op == ir::Opcode::SRem ||
+            op == ir::Opcode::And || op == ir::Opcode::Or || op == ir::Opcode::Xor ||
+            op == ir::Opcode::Shl || op == ir::Opcode::LShr || op == ir::Opcode::AShr;
+        if (op == ir::Opcode::Ret && !new_operands.empty() && new_operands[0] && new_operands[0]->type()) {
+            new_type = new_operands[0]->type();
+        } else if (width_tracks_operand0 && !new_operands.empty() &&
+                   new_operands[0] && new_operands[0]->type() && new_operands[0]->type()->is_integer()) {
+            new_type = new_operands[0]->type();
+        }
+
+        auto new_inst = std::make_shared<ir::Instruction>(op, new_type, repl_inst->name());
+        for (auto& v : new_operands) new_inst->add_operand(v);
         for (auto& [k, v] : repl_inst->metadata()) {
             new_inst->set_metadata(k, v);
         }
@@ -599,6 +632,16 @@ std::shared_ptr<ir::Function> PatternLibrary::apply(
     // name not bound in the source), reject the application by returning
     // nullptr. This prevents the search from accepting corrupt IR.
     if (!ir::validate_function(*result)) {
+        return nullptr;
+    }
+
+    // Second, stronger check: operand counts, integer typing (the bug this
+    // guards against directly), return type, phi consistency, dominance.
+    // validate_function above only checks "is this name defined earlier in
+    // layout order?" — it would have waved the i32/i8 mismatch straight
+    // through. A pattern-authoring bug here must never reach the caller as
+    // silently-invalid IR.
+    if (!ir::verify_function(*result).empty()) {
         return nullptr;
     }
 
@@ -795,7 +838,15 @@ void PatternLibrary::seed_builtin_patterns() {
             auto& bb = fn->add_block("entry");
             auto x_val = std::make_shared<ir::Value>(ir::IntegerType::i32(), "x");
             auto s_val = std::make_shared<ir::Value>(ir::IntegerType::i32(), "shift");
-            bb.add_instruction(std::make_shared<ir::Instruction>(ir::Opcode::Shl, ir::IntegerType::i32(), "r"));
+            // `shift` (log2 of the multiplier) has no binding in the source, so
+            // apply() and the e-graph both refuse to instantiate this: the
+            // "power of two" side condition is not expressible structurally.
+            // It used to be an operand-less `shl`, which they instantiated as
+            // invalid IR for every multiply.
+            auto shl = std::make_shared<ir::Instruction>(ir::Opcode::Shl, ir::IntegerType::i32(), "r");
+            shl->add_operand(x_val);
+            shl->add_operand(s_val);
+            bb.add_instruction(shl);
             bb.add_instruction(ir::inst::make_ret(std::make_shared<ir::Value>(ir::IntegerType::i32(), "r")));
             pat.replacement_function = fn;
         }

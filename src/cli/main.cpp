@@ -66,6 +66,8 @@ struct CliOptions {
     bool no_block_opt = false;     // --no-block-opt: disable block-level divide-and-conquer optimisation
     bool no_series_expand = false; // --no-series-expand: disable series-expansion loop optimisation
     bool no_align_opt = false;     // --no-align-opt: disable the alignment finalisation pass
+    bool no_screen = false;        // --no-screen: send every candidate straight to the solver
+    size_t screen_vectors = 0;     // --screen-vectors N: cap on concrete inputs per candidate (0 = default)
     bool no_algo_preprocessor = false;  // --no-algo-preprocessor: disable module-level algo pre-pass
     std::string vector_width = "auto";  // --vector-width <avx512|avx2|avx|auto>
     bool tui = false;             // --tui: launch the ncurses TUI
@@ -186,6 +188,9 @@ static void print_usage(const char* prog) {
               << "                            (splits fn into halving ranges, SMT-proves cheaper\n"
               << "                            equivalents for each; fallback when whole-fn search\n"
               << "                            finds nothing)\n"
+              << "  --no-screen               Do not pre-screen candidates on concrete inputs\n"
+              << "                            (edge cases + random) before the SMT solver\n"
+              << "  --screen-vectors <n>      Cap on concrete inputs per candidate (default 384)\n"
               << "  --no-align-opt            Disable alignment finalisation (aligned vector\n"
               << "                            moves where provable; no needless stack realignment)\n"
               << "  --no-series-expand        Disable series-expansion loop optimisation\n"
@@ -335,6 +340,10 @@ static CliOptions parse_args(int argc, char* argv[]) {
             opts.no_hole_synth = true;
         } else if (arg == "--no-block-opt") {
             opts.no_block_opt = true;
+        } else if (arg == "--no-screen") {
+            opts.no_screen = true;
+        } else if (arg == "--screen-vectors" && i + 1 < argc) {
+            opts.screen_vectors = static_cast<size_t>(std::stoul(argv[++i]));
         } else if (arg == "--no-align-opt") {
             opts.no_align_opt = true;
         } else if (arg == "--no-series-expand") {
@@ -805,6 +814,8 @@ int main(int argc, char* argv[]) {
     config.enable_block_opt = !opts.no_block_opt;
     config.enable_series_expand = !opts.no_series_expand;
     config.enable_align_opt = !opts.no_align_opt;
+    config.smt_config.screen_before_solving = !opts.no_screen;
+    if (opts.screen_vectors > 0) config.smt_config.screen.max_vectors = opts.screen_vectors;
     config.enable_algo_preprocessor = !opts.no_algo_preprocessor;
 
     // ── Vector width tier ─────────────────────────────────────────────

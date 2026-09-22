@@ -40,6 +40,8 @@
 #include "clunk/Search/CrossFunctionPasses.h"
 #include "clunk/Search/Inliner.h"
 #include "clunk/Search/LoopOpt.h"
+#include "clunk/Evaluator/DifferentialScreen.h"
+#include "clunk/IR/Verify.h"
 #include "clunk/Search/AlignOpt.h"
 #include "clunk/Search/MemOpt.h"
 #include "clunk/Search/VectorSynth.h"
@@ -2182,41 +2184,52 @@ std::shared_ptr<ir::Function> Pipeline::verify_and_select(
     // returns nullopt), because in that case SMT also returns Unknown
     // and there is NO verification path. Sound-by-construction candidates
     // bypass this check (they're adopted in tier 1 regardless).
+    // Concrete-input screen shared by the checks below. `--test-vectors N`
+    // still bounds the trust-unverified gate (N vectors, edge cases first).
+    auto screen_of = [&](const ir::Function& o, const ir::Function& c, bool honour_test_vectors) {
+        auto sc = s.smt.config().screen;
+        if (honour_test_vectors && config_.test_vector_count > 0) sc.max_vectors = config_.test_vector_count;
+        return evaluator::DifferentialScreen(sc).screen(o, c);
+    };
+
     auto safe_for_trust_unverified = [&](const ir::Function& orig,
                                           const std::shared_ptr<ir::Function>& cand)
         -> bool {
-        // Probe values: a small set of "interesting" integers.
-        static const int64_t kProbe[] = {
-            0, 1, -1, 2, -2, 3, -3, 7, -7, 8, 15, 16, 17,
-            127, 128, 255, 256, 1023, 1024,
-        };
-        constexpr size_t kProbeCount = sizeof(kProbe) / sizeof(kProbe[0]);
-        size_t nargs = orig.argument_count();
-        size_t n_vectors = config_.test_vector_count > 0
-                              ? std::min(config_.test_vector_count, kProbeCount)
-                              : kProbeCount;
+        // Survived = the original was interpretable, at least one input was
+        // comparable, and the candidate refined it on every one. Inconclusive
+        // (uninterpretable original: calls / memory / FP / loops, or a void
+        // return) is NOT good enough here: SMT would also return Unknown, so
+        // no verification path exists at all. This gate is a soundness
+        // check, so it runs even when the pre-solver screen is disabled.
+        return screen_of(orig, *cand, true).verdict == evaluator::ScreenVerdict::Survived;
+    };
 
-        for (size_t i = 0; i < n_vectors; ++i) {
-            std::vector<int64_t> args(nargs, kProbe[i]);
-            for (size_t j = 1; j < nargs; ++j) {
-                args[j] = kProbe[(i + j) % kProbeCount];
-            }
-            auto orig_r = evaluator::Interpreter::interpret(orig, args);
-            if (!orig_r) {
-                // Original is uninterpretable — NO verification path.
-                // SMT also returns Unknown for functions with calls /
-                // memory / FP / loops. Reject.
-                return false;
-            }
-            auto cand_r = evaluator::Interpreter::interpret(*cand, args);
-            if (!cand_r) {
-                // Candidate is uninterpretable but original IS — the
-                // candidate introduced an unsupported op. Reject.
-                return false;
-            }
-            if (*orig_r != *cand_r) return false;
+    // Sound-by-construction candidates skip the prover, so a bug in a
+    // generator would otherwise flow straight into the output (the E-graph
+    // used to emit operand-less `shl`s this way). Two cheap checks catch the
+    // two ways a generator goes wrong: malformed IR, and a value that
+    // differs from the original on a concrete input. Only enforced when the
+    // ORIGINAL passes the verifier itself, so a construct it does not
+    // understand can never veto a legitimate rewrite.
+    const bool original_wellformed = ir::verify_function(original).empty();
+    auto sound_candidate_ok = [&](const search::Candidate& c) -> bool {
+        std::string why;
+        if (original_wellformed) why = ir::verify_function(*c.function);
+        if (why.empty()) {
+            auto sr = screen_of(original, *c.function, false);
+            if (sr.verdict == evaluator::ScreenVerdict::Rejected)
+                why = "differs from the original: " + sr.reason;
         }
-        return true;
+        if (why.empty()) return true;
+        if (config_.verbose) {
+            std::cerr << "  [verify] " << original.name()
+                      << ": DROPPED a sound-by-construction candidate (" << why
+                      << ") — generator bug\n";
+        }
+        uint64_t chash = c.structural_hash ? c.structural_hash
+                                           : search::StochasticSearch::structural_hash(*c.function);
+        s.rejected_hashes.insert(chash);
+        return false;
     };
 
     if (!z3_available) {
@@ -2226,6 +2239,7 @@ std::shared_ptr<ir::Function> Pipeline::verify_and_select(
         // originals are rejected (no verification path exists).
         for (auto& sc : scored) {
             if (sc.candidate->sound) {
+                if (!sound_candidate_ok(*sc.candidate)) continue;
                 result.verified = true;
                 return sc.candidate->function;
             }
@@ -2245,12 +2259,22 @@ std::shared_ptr<ir::Function> Pipeline::verify_and_select(
         config_.max_smt_attempts > 0 ? config_.max_smt_attempts : 5;
     for (auto& sc : scored) {
         if (sc.candidate->sound) {
+            if (!sound_candidate_ok(*sc.candidate)) continue;
             result.verified = true;
             return sc.candidate->function;
         }
         if (smt_attempts >= MAX_SMT_ATTEMPTS) continue;
         ++smt_attempts;
         auto vr = s.smt.verify(original, *sc.candidate->function);
+        // A candidate the concrete screen killed never reached the solver, so
+        // it does not count against the per-round solver budget.
+        if (vr.screened) {
+            --smt_attempts;
+            if (config_.verbose && should_log_verbose("screen", original.name())) {
+                std::cerr << "  [screen] " << original.name()
+                          << ": candidate rejected before SMT — " << vr.message << "\n";
+            }
+        }
         if (vr.is_safe()) {
             // ── Optional Alive2 second opinion ───────────────────────────
             // SMT said this candidate is safe. If --alive2 is enabled,

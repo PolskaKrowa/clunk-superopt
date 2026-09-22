@@ -12,6 +12,10 @@ set(TEST_SOURCES
     test_peephole_cegis
     test_pattern
     test_egraph
+    test_egraph_validity
+    test_differential_screen
+    test_liveout
+    test_demanded_bits
     test_pipeline
     test_smt
     test_smt_soundness

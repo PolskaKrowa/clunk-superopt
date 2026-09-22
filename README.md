@@ -175,6 +175,24 @@ One future addition to Clunk will be to add comments to the optimised IR which s
   the work the per-function pipeline has to do.
 - **Loop optimisation** -- loop-aware transformations and analysis.
 - **Memory optimisation** -- memory access pattern improvements.
+- **Concrete-input screening** -- before a candidate reaches the SMT solver
+  it is run against the original on a few hundred edge-case and random
+  inputs (0, -1, INT_MIN, INT_MAX, every power of two, negated powers, low-bit
+  masks, shift-amount boundaries, plus uniform / sparse / dense / small random
+  vectors, each canonical for its argument's width). Only survivors are
+  proven. The screen follows LLVM's *refinement* rule, the same one the
+  encoder uses: where the original is poison or UB the candidate may do
+  anything, but it must never be less defined. `SMTVerifier::verify()` is the
+  single gate, so every search stage benefits; `verify_with_assumptions` is
+  exempt. Disable with `--no-screen`; cap the work with `--screen-vectors N`.
+- **IR verifier** (`clunk/IR/Verify.h`) -- operand counts, integer typing,
+  return types, phi consistency and SSA dominance. Used as a safety net on
+  E-graph output (which is flagged sound and so skips the prover).
+- **Live-out and demanded-bits analyses** (`clunk/Analysis/LiveOut.h`,
+  `DemandedBits.h`) -- SSA liveness (phi-aware, with `range_live_outs` for
+  "which values escape this instruction range?") and a backward analysis of
+  which bits of each integer value anyone can observe. Library analyses:
+  nothing rewrites with them yet.
 - **Alignment finalisation** -- a last pass over the whole module that
   raises vector load/store `align` to whatever is *provable* (so the
   backend emits `vmovapd` rather than `vmovupd`), and relaxes over-aligned,

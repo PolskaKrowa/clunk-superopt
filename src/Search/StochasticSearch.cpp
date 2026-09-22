@@ -23,6 +23,7 @@
 #include "clunk/Search/StochasticSearch.h"
 #include "clunk/Search/MutationScope.h"
 #include "clunk/IR/Clone.h"
+#include "clunk/Evaluator/DifferentialScreen.h"
 #include "clunk/Evaluator/Interpreter.h"
 #include "clunk/Pattern/PatternLibrary.h"
 
@@ -972,77 +973,26 @@ uint64_t StochasticSearch::canonical_structural_hash(const ir::Function& fn) {
 
 // ── Test-vector pre-filter ─────────────────────────────────────────────────
 //
-// Run the original and candidate through `num_vectors` random input
-// vectors via evaluator::Interpreter. Returns true iff the candidate
-// agrees with the original on every vector. If the interpreter cannot
-// evaluate either function (memory ops, floats, calls, loops, …) the
-// filter is skipped — returns true — so the candidate proceeds to SMT.
-// This is a strict pre-filter, never a soundness gate.
+// Run the original and candidate through up to `num_vectors` concrete input
+// vectors via the shared evaluator::DifferentialScreen: edge cases first
+// (0, -1, INT_MIN, INT_MAX, every power of two, ...), then random vectors,
+// each canonical for its argument's width. Returns false iff the candidate
+// is provably NOT a refinement of the original (a concrete counterexample).
+// Anything the interpreter cannot decide (memory ops, floats, calls, loops,
+// a void return, ...) is left to SMT — this is a strict pre-filter, never a
+// soundness gate. The screen is deterministic (fixed seed), which
+// test_stochastic_seed_reproducibility relies on.
 
 bool StochasticSearch::passes_test_vectors(const ir::Function& original,
                                             const ir::Function& candidate,
                                             size_t num_vectors) {
     if (num_vectors == 0) return true;
-    // The interpreter requires both functions have the same argument
-    // count. If they differ (shouldn't happen for our mutation set, but
-    // be defensive), skip the filter.
-    if (original.argument_count() != candidate.argument_count()) return true;
-    size_t nargs = original.argument_count();
-
-    // Deterministic probe set: a fixed small table of "interesting"
-    // integer values (Massalin §3.2 / GSO test_sets[]) followed by
-    // pseudo-random small values drawn from a fixed local RNG. The RNG
-    // is seeded with a constant so the filter is deterministic across
-    // runs (important for reproducibility — see test_stochastic_seed_
-    // reproducibility).
-    static const int64_t kProbe[] = {
-        0, 1, -1, 2, -2, 3, -3, 7, -7, 8, 15, 16, 17,
-        127, 128, 255, 256, 1023, 1024,
-        INT32_MIN, INT32_MAX, INT64_MIN, INT64_MAX,
-    };
-    constexpr size_t kProbeCount = sizeof(kProbe) / sizeof(kProbe[0]);
-    std::mt19937_64 local_rng(0xC0FFEEULL);
-
-    for (size_t i = 0; i < num_vectors; ++i) {
-        std::vector<int64_t> args(nargs);
-        if (nargs == 0) {
-            // No args — interpret once. The loop body below runs once
-            // (i goes from 0 to num_vectors-1, but with no args there's
-            // nothing to vary, so we cap at one iteration).
-            if (i > 0) break;
-        } else if (i < kProbeCount) {
-            // First few vectors use a single probe value for arg 0 and
-            // small constants for the rest. This catches the obvious
-            // off-by-one / sign-flip mutations.
-            args[0] = kProbe[i];
-            for (size_t j = 1; j < nargs; ++j) {
-                args[j] = (j < kProbeCount) ? kProbe[(i + j) % kProbeCount] : 0;
-            }
-        } else {
-            // Remaining vectors are pseudo-random small ints, biased
-            // toward small magnitudes (matches STOKE §5.1 and GSO's
-            // random_word() bias toward small values).
-            std::uniform_int_distribution<int64_t> dist(-1024, 1024);
-            for (auto& a : args) a = dist(local_rng);
-        }
-
-        auto orig_result = evaluator::Interpreter::interpret(original, args);
-        if (!orig_result) {
-            // Original is unsupported — skip the filter (don't penalise
-            // candidates for the original's limitations). The candidate
-            // will still go through SMT (or the trust_unverified gate in
-            // verify_and_select, which has its own soundness check).
-            return true;
-        }
-        auto cand_result = evaluator::Interpreter::interpret(candidate, args);
-        if (!cand_result) {
-            // Candidate is unsupported — skip the filter (let SMT decide).
-            return true;
-        }
-        if (*orig_result != *cand_result) {
-            stats_.candidates_rejected_by_test_vectors++;
-            return false;
-        }
+    evaluator::ScreenConfig cfg;
+    cfg.max_vectors = num_vectors;
+    const auto r = evaluator::DifferentialScreen(cfg).screen(original, candidate);
+    if (r.verdict == evaluator::ScreenVerdict::Rejected) {
+        stats_.candidates_rejected_by_test_vectors++;
+        return false;
     }
     return true;
 }
